@@ -1,0 +1,104 @@
+name: Serverless Image Processing CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+  OPENFAAS_GATEWAY: ${{ secrets.OPENFAAS_GATEWAY }}
+  OPENFAAS_PASSWORD: ${{ secrets.OPENFAAS_PASSWORD }}
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pillow minio requests
+
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+  build-and-push:
+    name: Build and push images
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push gateway image
+        run: |
+          docker build -t "${DOCKERHUB_NAMESPACE}/serverless-image-processing-gateway:latest" ./gateway
+          docker push "${DOCKERHUB_NAMESPACE}/serverless-image-processing-gateway:latest"
+
+      - name: Build and push function images
+        run: |
+          for function_name in fn-image-resize fn-image-enhance fn-image-filter fn-minio-trigger; do
+            docker build -t "${DOCKERHUB_NAMESPACE}/${function_name}:latest" "./${function_name}"
+            docker push "${DOCKERHUB_NAMESPACE}/${function_name}:latest"
+          done
+
+  deploy:
+    name: Deploy to OpenFaaS
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install faas-cli
+        run: |
+          curl -sSL https://cli.openfaas.com | sudo sh
+
+      - name: Log in to OpenFaaS
+        run: |
+          echo "${OPENFAAS_PASSWORD}" | faas-cli login \
+            --gateway "${OPENFAAS_GATEWAY}" \
+            --username admin \
+            --password-stdin
+
+      - name: Prepare deployment stack
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          namespace = os.environ["DOCKERHUB_NAMESPACE"]
+          content = Path("stack.yml").read_text(encoding="utf-8")
+          content = content.replace("127.0.0.1:5001/", f"{namespace}/")
+          content = content.replace("127.0.0.1:5001", namespace)
+          Path("stack.ci.yml").write_text(content, encoding="utf-8")
+          PY
+
+      - name: Deploy functions
+        run: |
+          faas-cli deploy -f stack.ci.yml --gateway "${OPENFAAS_GATEWAY}"
