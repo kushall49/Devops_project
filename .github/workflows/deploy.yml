@@ -1,4 +1,5 @@
 name: Serverless Image Processing CI/CD
+# Last CI/CD Run Trigger: 2026-05-13
 
 on:
   push:
